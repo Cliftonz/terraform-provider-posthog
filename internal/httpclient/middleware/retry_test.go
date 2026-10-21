@@ -306,6 +306,7 @@ func TestRetryTransport_RateLimitBudgetCountsSlowThrottledAttempts(t *testing.T)
 	// Counting only the sleeps (10, 20, 40, 80, 100ms...) would allow about a
 	// dozen 400ms attempts; counting the attempts too allows three.
 	assert.LessOrEqual(t, attempts.Load(), int32(3))
+	assert.GreaterOrEqual(t, attempts.Load(), int32(2), "a rate-limited request is still retried")
 }
 
 func TestRetryTransport_NoRetryConfigDoesNotRetryRateLimits(t *testing.T) {
