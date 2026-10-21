@@ -114,6 +114,7 @@ func TestResolveProjectID(t *testing.T) {
 	tests := map[string]struct {
 		config         FeatureFlagsDataSourceModel
 		defaultProject string
+		defaultOrg     string
 		projects       []httpclient.Project
 		wantID         string
 		wantErr        string
@@ -140,6 +141,12 @@ func TestResolveProjectID(t *testing.T) {
 			projects: named,
 			wantID:   "7",
 		},
+		"project_name in the provider's organization": {
+			config:     FeatureFlagsDataSourceModel{ProjectName: types.StringValue("production"), OrganizationID: types.StringNull()},
+			defaultOrg: testOrgID,
+			projects:   named,
+			wantID:     "7",
+		},
 		"project_name not found": {
 			config:   FeatureFlagsDataSourceModel{ProjectName: types.StringValue("preview"), OrganizationID: types.StringValue(testOrgID)},
 			projects: named,
@@ -159,8 +166,9 @@ func TestResolveProjectID(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			server := projectsServer(t, tt.projects)
 			d := &FeatureFlagsDataSource{
-				client:           httpclient.NewClient(server.Client(), server.URL, "test-key", "test", httpclient.WithNoRetry()),
-				defaultProjectID: tt.defaultProject,
+				client:                httpclient.NewClient(server.Client(), server.URL, "test-key", "test", httpclient.WithNoRetry()),
+				defaultProjectID:      tt.defaultProject,
+				defaultOrganizationID: tt.defaultOrg,
 			}
 
 			id, diags := d.resolveProjectID(context.Background(), tt.config)
@@ -169,6 +177,7 @@ func TestResolveProjectID(t *testing.T) {
 				require.True(t, diags.HasError())
 				summary, detail := diags.Errors()[0].Summary(), diags.Errors()[0].Detail()
 				assert.Contains(t, summary+" "+detail, tt.wantErr)
+				assert.True(t, id.IsNull(), "an error leaves project_id null")
 				return
 			}
 			require.False(t, diags.HasError(), "%v", diags)

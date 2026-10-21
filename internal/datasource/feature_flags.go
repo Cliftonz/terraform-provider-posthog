@@ -161,8 +161,8 @@ func (d *FeatureFlagsDataSource) Read(ctx context.Context, req datasource.ReadRe
 		return
 	}
 
-	if !config.ProjectName.IsNull() && config.OrganizationID.ValueString() == "" {
-		config.OrganizationID = types.StringValue(d.defaultOrganizationID)
+	if !config.ProjectName.IsNull() {
+		config.OrganizationID = types.StringValue(d.organizationID(config))
 	}
 
 	projectID, diags := d.resolveProjectID(ctx, config)
@@ -209,11 +209,12 @@ func (d *FeatureFlagsDataSource) resolveProjectID(ctx context.Context, config Fe
 				"Missing project_id",
 				"project_id or project_name must be set in the data source, or project_id at the provider level",
 			)
+			return types.StringNull(), diags
 		}
 		return types.StringValue(projectID), diags
 	}
 
-	orgID := config.OrganizationID.ValueString()
+	orgID := d.organizationID(config)
 	if orgID == "" {
 		diags.AddError(
 			"Missing organization_id",
@@ -251,6 +252,15 @@ func (d *FeatureFlagsDataSource) resolveProjectID(ctx context.Context, config Fe
 		return types.StringNull(), diags
 	}
 	return types.StringValue(projectID), diags
+}
+
+// organizationID is the organization project_name is looked up in: the data
+// source's own, or the provider's.
+func (d *FeatureFlagsDataSource) organizationID(config FeatureFlagsDataSourceModel) string {
+	if orgID := config.OrganizationID.ValueString(); orgID != "" {
+		return orgID
+	}
+	return d.defaultOrganizationID
 }
 
 // matchProjectByName finds the one project whose name equals name, ignoring

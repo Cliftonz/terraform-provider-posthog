@@ -44,6 +44,11 @@ func (c *PosthogClient) CreateFeatureFlag(ctx context.Context, projectID string,
 // so it takes one pass per state. A PostHog version that predates archiving
 // ignores the parameter and returns every flag in both passes, so flags are
 // de-duplicated by ID.
+//
+// Pages are offsets into a list ordered newest first, so a flag deleted or
+// archived while the pages are read can shift another past a page boundary and
+// out of the result. A flag missing that way surfaces when creating its key
+// again fails on apply, not as a wrong plan that succeeds.
 func (c *PosthogClient) ListFeatureFlags(ctx context.Context, projectID string) ([]FeatureFlag, error) {
 	var all []FeatureFlag
 	seen := make(map[int64]bool)
