@@ -75,3 +75,22 @@ func TestClientOptions_DoNotStackRetryTransports(t *testing.T) {
 	_, nested := transport.Base.(*middleware.RetryTransport)
 	assert.False(t, nested, "the option should replace the retry transport, not wrap it")
 }
+
+func TestDoRequest_RateLimitErrorSaysHowLongItWaitedAndWhy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "1800")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"detail":"Request was throttled. Expected available in 1800 seconds."}`))
+	}))
+	defer server.Close()
+
+	client := NewDefaultClient(server.URL, testAPIKey, testClientVersion)
+	_, status, err := client.doRequest(context.Background(), http.MethodGet, "/api/projects/1/feature_flags/1/", nil)
+
+	require.Error(t, err)
+	assert.Equal(t, HTTPStatusCode(http.StatusTooManyRequests), status)
+	assert.ErrorContains(t, err, "rate limited by PostHog after waiting 0s")
+	assert.ErrorContains(t, err, "hourly limit")
+	assert.ErrorContains(t, err, "-parallelism")
+	assert.ErrorContains(t, err, "Expected available in 1800 seconds", "PostHog's own message is kept")
+}

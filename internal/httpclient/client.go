@@ -132,6 +132,9 @@ func (c *PosthogClient) doRequest(ctx context.Context, method, path string, body
 
 	tflog.Debug(ctx, "received response", map[string]any{"status": resp.StatusCode})
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return respBody, HTTPStatusCode(resp.StatusCode), rateLimitError(resp, respBody)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return respBody, HTTPStatusCode(resp.StatusCode), fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
 	}
@@ -209,6 +212,21 @@ func doDelete(c *PosthogClient, ctx context.Context, path string) (HTTPStatusCod
 		return status, fmt.Errorf("failed to send DELETE request: %w", err)
 	}
 	return status, nil
+}
+
+// rateLimitError explains a 429 the retry transport stopped waiting on. PostHog's
+// body only says when the key frees up, which on its own reads as though the
+// provider never waited.
+func rateLimitError(resp *http.Response, body []byte) error {
+	waited := resp.Header.Get(middleware.RateLimitWaitedHeader)
+	reason := resp.Header.Get(middleware.RateLimitStopReasonHeader)
+	if waited == "" || reason == "" {
+		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	}
+	return fmt.Errorf("API error (status %d): rate limited by PostHog after waiting %s; stopped because %s. "+
+		"PostHog limits each personal API key to 480 requests a minute and 4,800 an hour: lower Terraform's "+
+		"-parallelism, use a separate API key per configuration, or run again later. PostHog said: %s",
+		resp.StatusCode, waited, reason, string(body))
 }
 
 // listAll fetches all pages from a paginated endpoint, following Next links until exhausted.

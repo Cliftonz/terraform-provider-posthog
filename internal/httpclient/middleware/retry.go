@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-log/tflog"
@@ -33,8 +34,18 @@ const (
 	DefaultRateLimitTotalWait = 5 * time.Minute
 )
 
+// RateLimitWaitedHeader and RateLimitStopReasonHeader are set on a 429 the
+// transport stops retrying: the time it spent waiting on 429s, and why it
+// stopped. The client reads them to explain the error.
+const (
+	RateLimitWaitedHeader     = "X-Posthog-Provider-Rate-Limit-Waited"
+	RateLimitStopReasonHeader = "X-Posthog-Provider-Rate-Limit-Stop-Reason"
+)
+
 type RetryConfig struct {
-	// MaxRetries is the maximum number of retry attempts (0 means no retries).
+	// MaxRetries bounds retries of server errors and timeouts. 0 turns off
+	// every retry, including waits on 429s, which are otherwise bounded by
+	// RateLimitTotalWait rather than by this count.
 	MaxRetries int
 	// InitialBackoff is the initial delay before the first retry.
 	InitialBackoff time.Duration
@@ -162,96 +173,130 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 
 		decision := t.decide(req, resp, err)
-		if decision.retry && decision.rateLimited {
-			backoff, reason := t.rateLimitBackoff(rateLimited, resp, rateLimitWaited)
-			if reason == "" {
-				t.logRetry(req, attempt+1, resp, err, backoff)
-				if err := sleep(req.Context(), backoff); err != nil {
-					return nil, fmt.Errorf("(attempt: %d) sleeping: %w", attempt+1, err)
-				}
-				rateLimited++
-				rateLimitWaited += backoff
-				continue
-			}
-			fields := attemptFields(req, attempt+1, resp, err)
-			fields["reason"] = reason
-			fields["rate_limit_waited"] = rateLimitWaited.String()
-			tflog.Debug(req.Context(), "giving up on rate-limited request", fields)
-			return resp, nil
+		var backoff time.Duration
+		exhausted := false
+		switch {
+		case !decision.retry:
+		case decision.rateLimited:
+			backoff, decision = t.rateLimitBackoff(decision, rateLimited, resp, rateLimitWaited)
+		case retries >= t.Config.MaxRetries:
+			exhausted = true
+		default:
+			backoff = t.calculateBackoff(retries)
 		}
-
-		exhausted := decision.retry && retries >= t.Config.MaxRetries
 		if !decision.retry || exhausted {
-			message, reason := t.stopped(decision, exhausted)
-			fields := attemptFields(req, attempt+1, resp, err)
-			fields["reason"] = reason
-			tflog.Debug(req.Context(), message, fields)
-			if err != nil {
-				if exhausted {
-					return nil, fmt.Errorf("(attempt: %d) %w", attempt+1, err)
-				}
-				// Name why it was not sent again. Without this the operator sees
-				// only the timeout and cannot tell that re-running may duplicate
-				// a resource this run already created.
-				return nil, fmt.Errorf("(attempt: %d) not retried, %s: %w", attempt+1, reason, err)
-			}
-			return resp, nil
+			return t.stop(req, attempt+1, resp, err, decision, exhausted, rateLimitWaited)
 		}
 
 		// No body to close before looping: attempt already drained and closed it.
-		backoff := t.calculateBackoff(retries)
-		t.logRetry(req, attempt+1, resp, err, backoff)
+		t.logRetry(req, attempt+1, resp, err, decision, backoff)
 		// Sleep under the caller's context, not the attempt's. An attempt that
 		// timed out leaves its own context expired, which would skip every backoff.
 		if err := sleep(req.Context(), backoff); err != nil {
 			return nil, fmt.Errorf("(attempt: %d) sleeping: %w", attempt+1, err)
 		}
-		retries++
+		if decision.rateLimited {
+			rateLimited++
+			rateLimitWaited += backoff
+		} else {
+			retries++
+		}
 	}
 }
 
-func (t *RetryTransport) logRetry(req *http.Request, attempt int, resp *http.Response, err error, backoff time.Duration) {
+// stop ends the loop with the last attempt's outcome. A rate-limited response
+// is returned with the time already spent waiting and the reason for stopping
+// written onto it, so the caller's error can say both; PostHog's own message
+// only says when the key frees up.
+func (t *RetryTransport) stop(req *http.Request, attempt int, resp *http.Response, err error, decision retryDecision, exhausted bool, rateLimitWaited time.Duration) (*http.Response, error) {
+	message, reason := t.stopped(decision, exhausted)
+	fields := attemptFields(req, attempt, resp, err)
+	fields["reason"] = reason
+
+	if decision.rateLimited {
+		fields["rate_limit_waited"] = rateLimitWaited.String()
+		tflog.Warn(req.Context(), "giving up on rate-limited request", fields)
+		resp.Header.Set(RateLimitWaitedHeader, rateLimitWaited.String())
+		resp.Header.Set(RateLimitStopReasonHeader, reason)
+		return resp, nil
+	}
+
+	tflog.Debug(req.Context(), message, fields)
+	if err != nil {
+		if exhausted {
+			return nil, fmt.Errorf("(attempt: %d) %w", attempt, err)
+		}
+		// Name why it was not sent again. Without this the operator sees
+		// only the timeout and cannot tell that re-running may duplicate
+		// a resource this run already created.
+		return nil, fmt.Errorf("(attempt: %d) not retried, %s: %w", attempt, reason, err)
+	}
+	return resp, nil
+}
+
+func (t *RetryTransport) logRetry(req *http.Request, attempt int, resp *http.Response, err error, decision retryDecision, backoff time.Duration) {
 	if t.Config.OnRetry != nil {
 		t.Config.OnRetry(attempt, resp, err)
 	}
 	fields := attemptFields(req, attempt, resp, err)
 	fields["backoff"] = backoff.String()
+	if decision.rateLimited {
+		// A wait of up to a minute, repeated across parallel requests, looks
+		// like a hung plan unless it is visible without TF_LOG=DEBUG.
+		fields["retry_after"] = resp.Header.Get("Retry-After")
+		tflog.Warn(req.Context(), "PostHog rate limit reached for this API key; waiting before retrying", fields)
+		return
+	}
 	tflog.Debug(req.Context(), "retrying request", fields)
 }
 
 // rateLimitBackoff is how long to wait before sending a rate-limited request
-// again, or, when it should not be sent again, why not. waited is the time this
-// request has already spent waiting on 429s.
-func (t *RetryTransport) rateLimitBackoff(rateLimited int, resp *http.Response, waited time.Duration) (time.Duration, string) {
+// again. When it should not be sent again, the returned decision says so and
+// why. waited is the time this request has already spent waiting on 429s.
+func (t *RetryTransport) rateLimitBackoff(decision retryDecision, rateLimited int, resp *http.Response, waited time.Duration) (time.Duration, retryDecision) {
+	stop := func(reason string) (time.Duration, retryDecision) {
+		decision.retry = false
+		decision.reason = reason
+		return 0, decision
+	}
+	// NoRetryConfig has to mean no retries at all, so MaxRetries = 0 turns off
+	// waiting on 429s as well, although they are otherwise not counted by it.
 	if t.Config.MaxRetries == 0 {
-		return 0, "retries are disabled"
+		return stop("retries are disabled")
 	}
 	backoff, ok := t.rateLimitWait(rateLimited, resp)
 	if !ok {
-		return 0, fmt.Sprintf("Retry-After is longer than %s", t.Config.RateLimitMaxWait)
+		return stop(fmt.Sprintf("PostHog asked to wait longer than %s, which means the hourly limit", t.Config.RateLimitMaxWait))
 	}
 	if waited+backoff > t.Config.RateLimitTotalWait {
-		return 0, fmt.Sprintf("waiting again would pass the %s rate-limit budget", t.Config.RateLimitTotalWait)
+		return stop(fmt.Sprintf("waiting again would pass the %s rate-limit budget", t.Config.RateLimitTotalWait))
 	}
-	return backoff, ""
+	return backoff, decision
 }
+
+// maxRateLimitJitter caps the jitter added to a Retry-After wait.
+const maxRateLimitJitter = 2 * time.Second
 
 // rateLimitWait is the wait PostHog asked for in Retry-After, or the computed
 // backoff when it gave none. ok is false when the ask is longer than
 // RateLimitMaxWait, which is not waited at all: a shorter wait would only be
 // rejected again.
+//
+// Every wait is positive, or the total budget would never fill and the loop
+// would never end.
 func (t *RetryTransport) rateLimitWait(rateLimited int, resp *http.Response) (time.Duration, bool) {
 	retryAfter, ok := parseRetryAfterHeader(resp.Header.Get("Retry-After"))
 	if !ok {
-		return t.calculateBackoff(rateLimited), true
+		// calculateBackoff goes to zero or below with a JitterFactor of 1 or more.
+		return max(t.calculateBackoff(rateLimited), t.Config.InitialBackoff), true
 	}
-	// Every wait must be positive, or the total budget never fills and the
-	// loop never ends. The parser already guarantees it; this keeps the
-	// guarantee next to the budget that depends on it.
-	if retryAfter <= 0 || retryAfter > t.Config.RateLimitMaxWait {
+	if retryAfter > t.Config.RateLimitMaxWait {
 		return 0, false
 	}
-	return retryAfter, true
+	// Parallel requests rejected together get the same Retry-After, and the
+	// window frees one slot at a time. Spread them out, never sooner than asked.
+	jitter := min(time.Duration(float64(retryAfter)*t.Config.JitterFactor), maxRateLimitJitter)
+	return retryAfter + time.Duration(rand.Float64()*float64(jitter)), true
 }
 
 // attempt sends the request once under its own deadline, response body
@@ -499,6 +544,10 @@ func parseRetryAfterHeader(header string) (time.Duration, bool) {
 	}
 
 	seconds, err := strconv.ParseInt(header, 10, 64)
+	if errors.Is(err, strconv.ErrRange) && !strings.HasPrefix(header, "-") {
+		// Too long to hold, so far too long to wait.
+		return maxRetryAfter, true
+	}
 	if err != nil || seconds <= 0 {
 		return 0, false
 	}

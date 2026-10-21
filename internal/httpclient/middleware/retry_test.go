@@ -162,44 +162,6 @@ func TestRetryTransport_NonRetryableStatusCodes(t *testing.T) {
 	}
 }
 
-func TestRetryTransport_RetryOn429WithRetryAfter(t *testing.T) {
-	var attempts atomic.Int32
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempt := attempts.Add(1)
-		if attempt < 2 {
-			w.Header().Set("Retry-After", "1") // 1 second
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{"error": "rate limited"}`))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status": "ok"}`))
-	}))
-	defer server.Close()
-
-	// Increment MaxBackOff to confirm that we're respecting the "Retry-After" header
-	config := testRetryConfig()
-	config.MaxBackoff = 2 * time.Second
-
-	transport := NewRetryTransport(http.DefaultTransport, config)
-	client := &http.Client{Transport: transport}
-
-	start := time.Now()
-	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
-	resp, err := client.Do(req)
-	elapsed := time.Since(start)
-
-	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Equal(t, int32(2), attempts.Load())
-	// Same floor-plus-ceiling as its two siblings: a timer can only fire late.
-	assert.GreaterOrEqual(t, elapsed, 1*time.Second, "should have honoured the 1s Retry-After")
-	assert.Less(t, elapsed, 2*time.Second, "should not have waited past the raised max backoff")
-}
-
 func TestRetryTransport_RetryOn429WaitsTheFullRetryAfterBeyondMaxBackoff(t *testing.T) {
 	var attempts atomic.Int32
 
@@ -282,6 +244,8 @@ func TestRetryTransport_RetryAfterBeyondRateLimitMaxWaitIsReturnedAtOnce(t *test
 	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode, "the 429 reaches the caller, whose error carries PostHog's message")
+	assert.Equal(t, "0s", resp.Header.Get(RateLimitWaitedHeader))
+	assert.Contains(t, resp.Header.Get(RateLimitStopReasonHeader), "hourly limit")
 	assert.Equal(t, int32(1), attempts.Load())
 	assert.Less(t, elapsed, time.Second, "should not have waited at all")
 	body, _ := io.ReadAll(resp.Body)
@@ -303,10 +267,8 @@ func TestRetryTransport_RateLimitWaitStopsAtTheTotalBudget(t *testing.T) {
 	transport := NewRetryTransport(http.DefaultTransport, config)
 	client := &http.Client{Transport: transport}
 
-	start := time.Now()
 	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
 	resp, err := client.Do(req)
-	elapsed := time.Since(start)
 
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
@@ -314,7 +276,8 @@ func TestRetryTransport_RateLimitWaitStopsAtTheTotalBudget(t *testing.T) {
 	assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
 	// One 1s wait fits the 1.5s budget; a second would not, so it is not started.
 	assert.Equal(t, int32(2), attempts.Load())
-	assert.Less(t, elapsed, 1500*time.Millisecond)
+	assert.Equal(t, "1s", resp.Header.Get(RateLimitWaitedHeader))
+	assert.Contains(t, resp.Header.Get(RateLimitStopReasonHeader), "rate-limit budget")
 }
 
 func TestRetryTransport_NoRetryConfigDoesNotRetryRateLimits(t *testing.T) {
@@ -507,7 +470,11 @@ func TestParseRetryAfter(t *testing.T) {
 		{"longer than a day is clamped", "90000", 24 * time.Hour, true},
 		{"too large for a Duration is clamped, not wrapped", "9223372037", 24 * time.Hour, true},
 		{"a value that wraps to exactly zero is clamped", "36028797018963968", 24 * time.Hour, true},
-		{"too large for an int64", "99999999999999999999", 0, false},
+		{"too large for an int64 is clamped", "99999999999999999999", 24 * time.Hour, true},
+		{"too negative for an int64", "-99999999999999999999", 0, false},
+		{"padded with spaces", " 5 ", 0, false},
+		{"fractional", "1.5", 0, false},
+		{"an HTTP date is not used", "Wed, 21 Oct 2026 07:28:00 GMT", 0, false},
 	}
 
 	for _, tt := range tests {
@@ -710,8 +677,8 @@ func TestRetryTransport_RetriesOnlyIdempotentMethods(t *testing.T) {
 		"POST does not retry on 504":  {http.MethodPost, http.StatusGatewayTimeout, 1},
 		"PATCH does not retry on 503": {http.MethodPatch, http.StatusServiceUnavailable, 1},
 		// A 429 is bounded by the rate-limit budget, not MaxRetries. With no
-		// Retry-After the waits are 10, 20, 40 and 80ms, which fill the 150ms
-		// budget below, so the fifth attempt is the last.
+		// Retry-After the waits are 10, 20, 40 and 80ms, which fit the 200ms
+		// budget below, and a fifth wait of 100ms would not.
 		"POST retries on 429":  {http.MethodPost, http.StatusTooManyRequests, 5},
 		"PATCH retries on 429": {http.MethodPatch, http.StatusTooManyRequests, 5},
 	}
@@ -727,7 +694,7 @@ func TestRetryTransport_RetriesOnlyIdempotentMethods(t *testing.T) {
 			defer server.Close()
 
 			config := testRetryConfig()
-			config.RateLimitTotalWait = 150 * time.Millisecond
+			config.RateLimitTotalWait = 200 * time.Millisecond
 			transport := NewRetryTransport(http.DefaultTransport, config)
 			client := &http.Client{Transport: transport}
 
@@ -1021,6 +988,84 @@ func TestReplaceRetryTransport_DoesNotStack(t *testing.T) {
 	assert.Zero(t, twice.Config.MaxRetries)
 }
 
+func TestRetryTransport_RateLimitWaitAddsJitterButNeverWaitsLess(t *testing.T) {
+	config := testRetryConfig()
+	config.JitterFactor = 0.2
+	transport := NewRetryTransport(http.DefaultTransport, config)
+	resp := &http.Response{StatusCode: 429, Header: http.Header{"Retry-After": []string{"1"}}}
+
+	seen := map[time.Duration]bool{}
+	for range 50 {
+		wait, ok := transport.rateLimitWait(0, resp)
+		require.True(t, ok)
+		assert.GreaterOrEqual(t, wait, time.Second, "never sooner than PostHog asked")
+		assert.LessOrEqual(t, wait, 1200*time.Millisecond)
+		seen[wait] = true
+	}
+	assert.Greater(t, len(seen), 1, "parallel requests given the same Retry-After should not wake together")
+}
+
+func TestRetryTransport_RateLimitWaitIsPositiveWithAnyJitter(t *testing.T) {
+	config := testRetryConfig()
+	config.JitterFactor = 1.5
+	transport := NewRetryTransport(http.DefaultTransport, config)
+
+	for range 50 {
+		wait, ok := transport.rateLimitWait(0, &http.Response{StatusCode: 429, Header: http.Header{}})
+		require.True(t, ok)
+		assert.Positive(t, wait, "a non-positive wait would never fill the budget")
+	}
+}
+
+func TestRetryTransport_CancellingDuringARateLimitWaitStopsAtOnce(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	transport := NewRetryTransport(http.DefaultTransport, testRetryConfig())
+	client := &http.Client{Transport: transport}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+
+	start := time.Now()
+	_, err := client.Do(req)
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "sleeping")
+	assert.Less(t, time.Since(start), time.Second, "Ctrl-C must not wait out the Retry-After")
+}
+
+func TestRetryTransport_OnRetryFiresForRateLimitWaits(t *testing.T) {
+	var attempts, callbacks atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) <= 2 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	config := testRetryConfig()
+	config.OnRetry = func(_ int, resp *http.Response, _ error) {
+		assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+		callbacks.Add(1)
+	}
+	transport := NewRetryTransport(http.DefaultTransport, config)
+	client := &http.Client{Transport: transport}
+
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	resp, err := client.Do(req)
+
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, int32(2), callbacks.Load())
+}
+
 func TestRetryTransport_RateLimitWait(t *testing.T) {
 	transport := NewRetryTransport(http.DefaultTransport, testRetryConfig())
 	rateLimited := func(retryAfter string) *http.Response {
@@ -1039,6 +1084,7 @@ func TestRetryTransport_RateLimitWait(t *testing.T) {
 		"Retry-After up to RateLimitMaxWait is honoured":    {rateLimited("2"), 2 * time.Second, true},
 		"Retry-After past RateLimitMaxWait is not waited":   {rateLimited("3"), 0, false},
 		"an overflowing Retry-After is not waited":          {rateLimited("9223372037"), 0, false},
+		"an out-of-range Retry-After is not waited":         {rateLimited("99999999999999999999"), 0, false},
 	}
 
 	for name, tt := range tests {
