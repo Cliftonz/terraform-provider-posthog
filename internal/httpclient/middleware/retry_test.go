@@ -506,6 +506,7 @@ func TestParseRetryAfter(t *testing.T) {
 		{"invalid", "invalid", 0, false},
 		{"longer than a day is clamped", "90000", 24 * time.Hour, true},
 		{"too large for a Duration is clamped, not wrapped", "9223372037", 24 * time.Hour, true},
+		{"a value that wraps to exactly zero is clamped", "36028797018963968", 24 * time.Hour, true},
 		{"too large for an int64", "99999999999999999999", 0, false},
 	}
 
