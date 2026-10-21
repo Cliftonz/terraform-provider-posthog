@@ -223,10 +223,14 @@ func rateLimitError(resp *http.Response, body []byte) error {
 	if waited == "" || reason == "" {
 		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
 	}
-	return fmt.Errorf("API error (status %d): rate limited by PostHog after waiting %s; stopped because %s. "+
+	after := ""
+	if waited != "0s" {
+		after = " after waiting " + waited
+	}
+	return fmt.Errorf("API error (status %d): rate limited by PostHog%s; stopped because %s. "+
 		"PostHog limits each personal API key to 480 requests a minute and 4,800 an hour: lower Terraform's "+
 		"-parallelism, use a separate API key per configuration, or run again later. PostHog said: %s",
-		resp.StatusCode, waited, reason, string(body))
+		resp.StatusCode, after, reason, string(body))
 }
 
 // listAll fetches all pages from a paginated endpoint, following Next links until exhausted.

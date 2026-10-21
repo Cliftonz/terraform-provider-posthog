@@ -89,7 +89,7 @@ func TestDoRequest_RateLimitErrorSaysHowLongItWaitedAndWhy(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Equal(t, HTTPStatusCode(http.StatusTooManyRequests), status)
-	assert.ErrorContains(t, err, "rate limited by PostHog after waiting 0s")
+	assert.ErrorContains(t, err, "rate limited by PostHog; stopped because", "no wait to report on the hourly limit")
 	assert.ErrorContains(t, err, "hourly limit")
 	assert.ErrorContains(t, err, "-parallelism")
 	assert.ErrorContains(t, err, "Expected available in 1800 seconds", "PostHog's own message is kept")

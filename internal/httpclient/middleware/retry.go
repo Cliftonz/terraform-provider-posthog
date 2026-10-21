@@ -36,7 +36,9 @@ const (
 
 // RateLimitWaitedHeader and RateLimitStopReasonHeader are set on a 429 the
 // transport stops retrying: the time it spent waiting on 429s, and why it
-// stopped. The client reads them to explain the error.
+// stopped. The client reads them to explain the error. They ride on the
+// response rather than a typed error because a RoundTripper that returns an
+// error loses the response, and with it PostHog's message.
 const (
 	RateLimitWaitedHeader     = "X-Posthog-Provider-Rate-Limit-Waited"
 	RateLimitStopReasonHeader = "X-Posthog-Provider-Rate-Limit-Stop-Reason"
@@ -62,9 +64,10 @@ type RetryConfig struct {
 	// (MaxRetries+1) * AttemptTimeout plus the backoff between attempts, plus
 	// up to RateLimitTotalWait when PostHog rate-limits it.
 	AttemptTimeout time.Duration
-	// RateLimitMaxWait is the longest single wait on a 429. A Retry-After up to
-	// it is waited out in full, even past MaxBackoff; a longer one returns the
-	// 429 to the caller straight away. Unset takes DefaultRateLimitMaxWait.
+	// RateLimitMaxWait is the longest Retry-After waited out on a 429. One up
+	// to it is waited in full, even past MaxBackoff, plus up to 2 seconds of
+	// jitter; a longer one returns the 429 to the caller straight away. Unset
+	// takes DefaultRateLimitMaxWait.
 	RateLimitMaxWait time.Duration
 	// RateLimitTotalWait bounds the time one request spends waiting on 429s.
 	// Waits on a 429 do not count against MaxRetries, since a rate-limited
