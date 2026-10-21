@@ -280,6 +280,34 @@ func TestRetryTransport_RateLimitWaitStopsAtTheTotalBudget(t *testing.T) {
 	assert.Contains(t, resp.Header.Get(RateLimitStopReasonHeader), "rate-limit budget")
 }
 
+func TestRetryTransport_RateLimitBudgetCountsSlowThrottledAttempts(t *testing.T) {
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		// Each 429 takes far longer than the 10ms wait it asks for.
+		time.Sleep(400 * time.Millisecond)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	config := testRetryConfig()
+	config.RateLimitTotalWait = time.Second
+	transport := NewRetryTransport(http.DefaultTransport, config)
+	client := &http.Client{Transport: transport}
+
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	resp, err := client.Do(req)
+
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+	// Counting only the sleeps (10, 20, 40, 80, 100ms...) would allow about a
+	// dozen 400ms attempts; counting the attempts too allows three.
+	assert.LessOrEqual(t, attempts.Load(), int32(3))
+}
+
 func TestRetryTransport_NoRetryConfigDoesNotRetryRateLimits(t *testing.T) {
 	var attempts atomic.Int32
 
