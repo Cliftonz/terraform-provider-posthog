@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-jsontypes/jsontypes"
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
@@ -630,7 +631,7 @@ func platformAlertWarnings(resp httpclient.PlatformAlert) diag.Diagnostics {
 				"state, so plans stay clean until you do.", who),
 		)
 	}
-	if util.PtrToString(resp.SnoozeUntil) != "" {
+	if snoozedUntil(resp.SnoozeUntil, time.Now()) {
 		diags.AddWarning(
 			"Platform alert is snoozed",
 			fmt.Sprintf("Alert %s is snoozed until %s and notifies nobody until then. Terraform does not "+
@@ -648,12 +649,32 @@ func platformAlertWarnings(resp httpclient.PlatformAlert) diag.Diagnostics {
 	return diags
 }
 
+// snoozedUntil reports whether a snooze is still running at now. PostHog keeps the timestamp after
+// it passes. An unparseable value counts as running, so the warning errs toward showing.
+func snoozedUntil(snoozeUntil *string, now time.Time) bool {
+	value := strings.TrimSpace(util.PtrToString(snoozeUntil))
+	if value == "" {
+		return false
+	}
+	until, err := time.Parse(time.RFC3339, value)
+	return err != nil || until.After(now)
+}
+
 // ModifyResourcePlan rejects configurations PostHog would refuse, so they fail at plan time with
 // a message naming the problem. Every optional attribute has a schema default, so the plan holds
 // the value PostHog will receive.
 func (o PlatformAlertOps) ModifyResourcePlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.Plan.Raw.IsNull() {
 		return
+	}
+	// Under -refresh=false a moved alert still holds the placeholder id, and the update that resolves
+	// it returns the platform id. Planning the id as known would fail that apply as inconsistent.
+	if !req.State.Raw.IsNull() && !req.Plan.Raw.Equal(req.State.Raw) {
+		var stateID types.String
+		resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("id"), &stateID)...)
+		if strings.HasPrefix(stateID.ValueString(), legacyIDPrefix) {
+			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("id"), types.StringUnknown())...)
+		}
 	}
 	var plan PlatformAlertTFModel
 	// An unknown nested object cannot be read into the model. The API checks it on apply instead.

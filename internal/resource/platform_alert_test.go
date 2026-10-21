@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-jsontypes/jsontypes"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
@@ -248,6 +249,24 @@ func TestPlatformAlertRead_ResolvesAMovedAlert(t *testing.T) {
 			}
 			require.NoError(t, err)
 			assert.Equal(t, testPlatformAlertID, alert.ID)
+		})
+	}
+}
+
+func TestSnoozedUntil(t *testing.T) {
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	tests := map[string]struct {
+		snoozeUntil *string
+		want        bool
+	}{
+		"not snoozed":       {snoozeUntil: nil},
+		"snooze running":    {snoozeUntil: util.StringPtr("2026-10-21T13:00:00Z"), want: true},
+		"snooze expired":    {snoozeUntil: util.StringPtr("2026-10-20T13:00:00.123456Z")},
+		"unparseable value": {snoozeUntil: util.StringPtr("tomorrow"), want: true},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, test.want, snoozedUntil(test.snoozeUntil, now))
 		})
 	}
 }
