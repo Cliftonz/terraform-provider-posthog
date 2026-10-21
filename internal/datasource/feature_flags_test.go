@@ -2,8 +2,12 @@ package datasource
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/posthog/terraform-provider/internal/httpclient"
 	"github.com/posthog/terraform-provider/internal/util"
 	"github.com/stretchr/testify/assert"
@@ -53,21 +57,126 @@ func TestMatchProjectByName(t *testing.T) {
 		{ID: 5, Name: util.StringPtr("DUP")},
 	}
 
-	id, found, err := matchProjectByName(projects, "production")
-	require.NoError(t, err)
-	assert.True(t, found)
-	assert.Equal(t, "1", id)
+	tests := map[string]struct {
+		projects  []httpclient.Project
+		name      string
+		wantID    string
+		wantFound bool
+		wantErr   string
+	}{
+		"matches ignoring case":               {projects: projects, name: "production", wantID: "1", wantFound: true},
+		"matches ignoring surrounding spaces": {projects: projects, name: "staging", wantID: "2", wantFound: true},
+		"an unmatched name is not an error":   {projects: projects, name: "preview-123"},
+		"no projects at all":                  {projects: nil, name: "production"},
+		"a shared name is an error":           {projects: projects, name: "dup", wantErr: "IDs 4, 5"},
+	}
 
-	id, found, err = matchProjectByName(projects, "staging")
-	require.NoError(t, err)
-	assert.True(t, found)
-	assert.Equal(t, "2", id)
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			id, found, err := matchProjectByName(tt.projects, tt.name)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantFound, found)
+			assert.Equal(t, tt.wantID, id)
+		})
+	}
+}
 
-	_, found, err = matchProjectByName(projects, "preview-123")
-	require.NoError(t, err)
-	assert.False(t, found, "an unmatched name is not an error")
+const testOrgID = "11111111-2222-3333-4444-555555555555"
 
-	_, _, err = matchProjectByName(projects, "dup")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "IDs 4, 5")
+// projectsServer answers the organization's project list. A nil projects
+// list makes it fail the request instead.
+func projectsServer(t *testing.T, projects []httpclient.Project) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/organizations/"+testOrgID+"/projects/", r.URL.Path)
+		if projects == nil {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(httpclient.PaginatedResponse[httpclient.Project]{Results: projects}))
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func TestResolveProjectID(t *testing.T) {
+	named := []httpclient.Project{
+		{ID: 7, Name: util.StringPtr("production")},
+		{ID: 8, Name: util.StringPtr("dup")},
+		{ID: 9, Name: util.StringPtr("dup")},
+	}
+
+	tests := map[string]struct {
+		config         FeatureFlagsDataSourceModel
+		defaultProject string
+		projects       []httpclient.Project
+		wantID         string
+		wantErr        string
+	}{
+		"project_id from the data source": {
+			config: FeatureFlagsDataSourceModel{ProjectID: types.StringValue("42"), ProjectName: types.StringNull()},
+			wantID: "42",
+		},
+		"project_id from the provider": {
+			config:         FeatureFlagsDataSourceModel{ProjectID: types.StringNull(), ProjectName: types.StringNull()},
+			defaultProject: "43",
+			wantID:         "43",
+		},
+		"no project at all": {
+			config:  FeatureFlagsDataSourceModel{ProjectID: types.StringNull(), ProjectName: types.StringNull()},
+			wantErr: "Missing project_id",
+		},
+		"project_name with no organization": {
+			config:  FeatureFlagsDataSourceModel{ProjectName: types.StringValue("production"), OrganizationID: types.StringNull()},
+			wantErr: "Missing organization_id",
+		},
+		"project_name found": {
+			config:   FeatureFlagsDataSourceModel{ProjectName: types.StringValue("production"), OrganizationID: types.StringValue(testOrgID)},
+			projects: named,
+			wantID:   "7",
+		},
+		"project_name not found": {
+			config:   FeatureFlagsDataSourceModel{ProjectName: types.StringValue("preview"), OrganizationID: types.StringValue(testOrgID)},
+			projects: named,
+		},
+		"project_name shared by two projects": {
+			config:   FeatureFlagsDataSourceModel{ProjectName: types.StringValue("dup"), OrganizationID: types.StringValue(testOrgID)},
+			projects: named,
+			wantErr:  "Set project_id instead.",
+		},
+		"listing projects fails": {
+			config:  FeatureFlagsDataSourceModel{ProjectName: types.StringValue("production"), OrganizationID: types.StringValue(testOrgID)},
+			wantErr: "Error listing projects",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			server := projectsServer(t, tt.projects)
+			d := &FeatureFlagsDataSource{
+				client:           httpclient.NewClient(server.Client(), server.URL, "test-key", "test", httpclient.WithNoRetry()),
+				defaultProjectID: tt.defaultProject,
+			}
+
+			id, diags := d.resolveProjectID(context.Background(), tt.config)
+
+			if tt.wantErr != "" {
+				require.True(t, diags.HasError())
+				summary, detail := diags.Errors()[0].Summary(), diags.Errors()[0].Detail()
+				assert.Contains(t, summary+" "+detail, tt.wantErr)
+				return
+			}
+			require.False(t, diags.HasError(), "%v", diags)
+			if tt.wantID == "" {
+				assert.True(t, id.IsNull(), "an unmatched project_name resolves to a null project_id")
+				return
+			}
+			assert.Equal(t, tt.wantID, id.ValueString())
+		})
+	}
 }

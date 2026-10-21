@@ -3,6 +3,7 @@ package datasource
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -67,8 +68,9 @@ func (d *FeatureFlagsDataSource) Schema(_ context.Context, _ datasource.SchemaRe
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "List the feature flags in a project. Use this to resolve the numeric `id` of each flag " +
 			"that already exists, so a `for_each` `import {}` block can adopt them into `posthog_feature_flag` " +
-			"resources. Deleted flags are left out; archived flags are included, because an archived flag still " +
-			"holds its key and creating a new flag with that key fails.",
+			"resources. Deleted flags are left out, as are the flags PostHog creates internally for surveys and product " +
+			"tours. Archived flags are included, because an archived flag still holds its key and creating a new flag " +
+			"with that key fails.",
 		Attributes: map[string]schema.Attribute{
 			"project_id": schema.StringAttribute{
 				Optional:            true,
@@ -81,16 +83,24 @@ func (d *FeatureFlagsDataSource) Schema(_ context.Context, _ datasource.SchemaRe
 			"project_name": schema.StringAttribute{
 				Optional: true,
 				Validators: []validator.String{
-					stringvalidator.LengthAtLeast(1),
+					// Names are compared trimmed, so a blank one would match a
+					// project whose name is empty.
+					stringvalidator.RegexMatches(regexp.MustCompile(`\S`), "must not be blank"),
 				},
 				MarkdownDescription: "Name of the project to list flags in, matched case-insensitively within `organization_id`. " +
 					"Use this when the project ID is not known until apply, for example a project created in the same configuration. " +
-					"When no project has this name, `flags` is empty rather than an error. More than one project with the name is an error.",
+					"When no project has this name, `flags` is empty rather than an error. More than one project with the name is an error. " +
+					"If a project with this name already exists, import it into your `posthog_project` resource rather than creating a second one: " +
+					"before the new project exists, this name matches the old one, and adopting its flags into resources pointed at the new project " +
+					"would plan to replace them, deleting them from the old project.",
 			},
 			"organization_id": schema.StringAttribute{
 				Optional:            true,
 				Computed:            true,
-				MarkdownDescription: "Organization to look `project_name` up in. Defaults to the provider-level organization_id. Only used with `project_name`.",
+				MarkdownDescription: "Organization to look `project_name` up in. Defaults to the provider-level organization_id. Requires `project_name`.",
+				Validators: []validator.String{
+					stringvalidator.AlsoRequires(path.MatchRoot("project_name")),
+				},
 			},
 			"flags": schema.ListNestedAttribute{
 				Computed:            true,
@@ -151,26 +161,27 @@ func (d *FeatureFlagsDataSource) Read(ctx context.Context, req datasource.ReadRe
 		return
 	}
 
-	projectID, found, diags := d.resolveProjectID(ctx, &config)
+	if !config.ProjectName.IsNull() && config.OrganizationID.ValueString() == "" {
+		config.OrganizationID = types.StringValue(d.defaultOrganizationID)
+	}
+
+	projectID, diags := d.resolveProjectID(ctx, config)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	config.ProjectID = projectID
 
 	var flags []httpclient.FeatureFlag
-	if found {
-		config.ProjectID = types.StringValue(projectID)
-
-		tflog.Debug(ctx, "Listing feature flags", map[string]any{"project_id": projectID})
+	if !projectID.IsNull() {
+		tflog.Debug(ctx, "Listing feature flags", map[string]any{"project_id": projectID.ValueString()})
 
 		var err error
-		flags, err = d.client.ListFeatureFlags(ctx, projectID)
+		flags, err = d.client.ListFeatureFlags(ctx, projectID.ValueString())
 		if err != nil {
-			resp.Diagnostics.AddError("Error listing feature flags", err.Error())
+			resp.Diagnostics.AddError("Error listing feature flags", fmt.Sprintf("Could not list the feature flags in project %s: %s", projectID.ValueString(), err))
 			return
 		}
-	} else {
-		config.ProjectID = types.StringNull()
 	}
 
 	list, diags := featureFlagsToList(ctx, flags)
@@ -183,9 +194,9 @@ func (d *FeatureFlagsDataSource) Read(ctx context.Context, req datasource.ReadRe
 	resp.Diagnostics.Append(resp.State.Set(ctx, &config)...)
 }
 
-// resolveProjectID returns the project to list flags in. found is false only
-// when project_name names no project, which the caller reports as no flags.
-func (d *FeatureFlagsDataSource) resolveProjectID(ctx context.Context, config *FeatureFlagsDataSourceModel) (string, bool, diag.Diagnostics) {
+// resolveProjectID returns the project to list flags in. It is null only when
+// project_name names no project, which Read reports as no flags.
+func (d *FeatureFlagsDataSource) resolveProjectID(ctx context.Context, config FeatureFlagsDataSourceModel) (types.String, diag.Diagnostics) {
 	var diags diag.Diagnostics
 
 	if config.ProjectName.IsNull() {
@@ -198,22 +209,17 @@ func (d *FeatureFlagsDataSource) resolveProjectID(ctx context.Context, config *F
 				"Missing project_id",
 				"project_id or project_name must be set in the data source, or project_id at the provider level",
 			)
-			return "", false, diags
 		}
-		return projectID, true, diags
+		return types.StringValue(projectID), diags
 	}
 
 	orgID := config.OrganizationID.ValueString()
-	if orgID == "" {
-		orgID = d.defaultOrganizationID
-		config.OrganizationID = types.StringValue(orgID)
-	}
 	if orgID == "" {
 		diags.AddError(
 			"Missing organization_id",
 			"project_name is looked up within an organization: set organization_id in the data source or at the provider level",
 		)
-		return "", false, diags
+		return types.StringNull(), diags
 	}
 
 	name := strings.TrimSpace(config.ProjectName.ValueString())
@@ -225,16 +231,26 @@ func (d *FeatureFlagsDataSource) resolveProjectID(ctx context.Context, config *F
 
 	projects, err := d.client.ListProjects(ctx, orgID)
 	if err != nil {
-		diags.AddError("Error listing projects", err.Error())
-		return "", false, diags
+		diags.AddError("Error listing projects", fmt.Sprintf("Could not list the projects in organization %s to find %q: %s", orgID, name, err))
+		return types.StringNull(), diags
 	}
 
 	projectID, found, err := matchProjectByName(projects, name)
 	if err != nil {
 		diags.AddError("Ambiguous project_name", fmt.Sprintf("%s. Set project_id instead.", err))
-		return "", false, diags
+		return types.StringNull(), diags
 	}
-	return projectID, found, diags
+	if !found {
+		// Expected on a new environment's first plan, so not a warning; logged
+		// so a misspelled name can still be told apart from it.
+		tflog.Info(ctx, "No project matched project_name; returning no flags", map[string]any{
+			"organization_id": orgID,
+			"project_name":    name,
+			"projects_seen":   len(projects),
+		})
+		return types.StringNull(), diags
+	}
+	return types.StringValue(projectID), diags
 }
 
 // matchProjectByName finds the one project whose name equals name, ignoring
@@ -278,7 +294,7 @@ func featureFlagsToList(ctx context.Context, flags []httpclient.FeatureFlag) (ty
 			ID:       types.Int64Value(f.ID),
 			Key:      types.StringValue(f.Key),
 			Name:     core.PtrToStringNullIfEmptyTrimmed(f.Name),
-			Active:   core.PtrToBool(f.Active),
+			Active:   types.BoolValue(f.Active != nil && *f.Active),
 			Archived: types.BoolValue(f.Archived != nil && *f.Archived),
 		})
 	}

@@ -75,3 +75,18 @@ func TestClientOptions_DoNotStackRetryTransports(t *testing.T) {
 	_, nested := transport.Base.(*middleware.RetryTransport)
 	assert.False(t, nested, "the option should replace the retry transport, not wrap it")
 }
+
+func TestListAll_FailsOnAPaginationLinkItCannotFollow(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next := "http://[::1"
+		writeJSONResponse(t, w, PaginatedResponse[Role]{Results: []Role{{ID: "r1"}}, Next: &next})
+	}))
+	defer server.Close()
+
+	client := newTestPosthogClient(server)
+	roles, err := listAll[Role](&client, context.Background(), "/api/organizations/x/roles/")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid pagination URL")
+	assert.Nil(t, roles, "a truncated list must not be returned as complete")
+}

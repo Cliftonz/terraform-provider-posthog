@@ -186,9 +186,9 @@ import {
 }
 
 // TestFeatureFlagsDataSource_DefaultsAndConflicts checks the data source with
-// no arguments, which lists the provider-level project, and that setting both
-// project_id and project_name is rejected before any request is made. The
-// rejected configuration goes first, because the test framework destroys using
+// no arguments, which lists the provider-level project, and that setting
+// project_id with project_name, or organization_id without it, is rejected
+// before any request is made. The rejected configurations go first, because the test framework destroys using
 // the last step's configuration.
 func TestFeatureFlagsDataSource_DefaultsAndConflicts(t *testing.T) {
 	skipIfNotAcceptance(t)
@@ -209,6 +209,17 @@ provider "posthog" {}
 data "posthog_feature_flags" "test" {
   project_id   = %q
   project_name = "anything"
+}
+`, projectID),
+				ExpectError: regexp.MustCompile(`(?s)Invalid Attribute Combination.*project_name`),
+			},
+			{
+				Config: fmt.Sprintf(`
+provider "posthog" {}
+
+data "posthog_feature_flags" "test" {
+  project_id      = %q
+  organization_id = "anything"
 }
 `, projectID),
 				ExpectError: regexp.MustCompile(`(?s)Invalid Attribute Combination.*project_name`),

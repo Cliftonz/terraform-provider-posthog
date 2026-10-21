@@ -51,7 +51,7 @@ func (c *PosthogClient) ListFeatureFlags(ctx context.Context, projectID string) 
 		path := fmt.Sprintf("/api/projects/%s/feature_flags/?archived=%s", projectID, archived)
 		flags, err := listAll[FeatureFlag](c, ctx, path)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("listing flags with archived=%s: %w", archived, err)
 		}
 		for _, f := range flags {
 			if !seen[f.ID] {

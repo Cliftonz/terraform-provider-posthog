@@ -55,6 +55,24 @@ func TestListFeatureFlags_DeduplicatesWhenTheArchivedFilterIsIgnored(t *testing.
 	assert.Len(t, flags, 2, "both passes returned the same flags, which must appear once")
 }
 
+func TestListFeatureFlags_FailsWholeWhenTheArchivedPassFails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("archived") == "true" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		writeJSONResponse(t, w, PaginatedResponse[FeatureFlag]{Results: []FeatureFlag{{ID: 1, Key: "a"}}})
+	}))
+	defer server.Close()
+
+	client := newTestPosthogClient(server)
+	flags, err := client.ListFeatureFlags(context.Background(), "123")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "archived=true", "the error names the pass that failed")
+	assert.Nil(t, flags, "half a list would look like flags that do not exist")
+}
+
 func TestListFeatureFlags_ReturnsTheListError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)

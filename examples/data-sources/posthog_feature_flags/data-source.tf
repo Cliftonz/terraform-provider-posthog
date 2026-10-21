@@ -18,6 +18,12 @@ output "flag_keys" {
 # environment's project ID is not known until apply. Until that project exists
 # the data source finds no flags, so nothing is imported and every flag is
 # created.
+#
+# If the environment already has a project with this name, import that project
+# into posthog_project.this first instead of creating a second one. Otherwise
+# the name matches the old project, and adopting its flags into resources that
+# point at the new project plans to replace them, deleting them from the old
+# project.
 variable "environment" {
   type = string
 }

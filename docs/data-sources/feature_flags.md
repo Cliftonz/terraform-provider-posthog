@@ -3,12 +3,12 @@
 page_title: "posthog_feature_flags Data Source - posthog"
 subcategory: ""
 description: |-
-  List the feature flags in a project. Use this to resolve the numeric id of each flag that already exists, so a for_each import {} block can adopt them into posthog_feature_flag resources. Deleted flags are left out; archived flags are included, because an archived flag still holds its key and creating a new flag with that key fails.
+  List the feature flags in a project. Use this to resolve the numeric id of each flag that already exists, so a for_each import {} block can adopt them into posthog_feature_flag resources. Deleted flags are left out, as are the flags PostHog creates internally for surveys and product tours. Archived flags are included, because an archived flag still holds its key and creating a new flag with that key fails.
 ---
 
 # posthog_feature_flags (Data Source)
 
-List the feature flags in a project. Use this to resolve the numeric `id` of each flag that already exists, so a `for_each` `import {}` block can adopt them into `posthog_feature_flag` resources. Deleted flags are left out; archived flags are included, because an archived flag still holds its key and creating a new flag with that key fails.
+List the feature flags in a project. Use this to resolve the numeric `id` of each flag that already exists, so a `for_each` `import {}` block can adopt them into `posthog_feature_flag` resources. Deleted flags are left out, as are the flags PostHog creates internally for surveys and product tours. Archived flags are included, because an archived flag still holds its key and creating a new flag with that key fails.
 
 ## Example Usage
 
@@ -33,6 +33,12 @@ output "flag_keys" {
 # environment's project ID is not known until apply. Until that project exists
 # the data source finds no flags, so nothing is imported and every flag is
 # created.
+#
+# If the environment already has a project with this name, import that project
+# into posthog_project.this first instead of creating a second one. Otherwise
+# the name matches the old project, and adopting its flags into resources that
+# point at the new project plans to replace them, deleting them from the old
+# project.
 variable "environment" {
   type = string
 }
@@ -75,9 +81,9 @@ import {
 
 ### Optional
 
-- `organization_id` (String) Organization to look `project_name` up in. Defaults to the provider-level organization_id. Only used with `project_name`.
+- `organization_id` (String) Organization to look `project_name` up in. Defaults to the provider-level organization_id. Requires `project_name`.
 - `project_id` (String) Project ID (environment) to list flags in. Defaults to the provider-level project_id. Conflicts with `project_name`. When the project is looked up by `project_name` and none matches, this is null.
-- `project_name` (String) Name of the project to list flags in, matched case-insensitively within `organization_id`. Use this when the project ID is not known until apply, for example a project created in the same configuration. When no project has this name, `flags` is empty rather than an error. More than one project with the name is an error.
+- `project_name` (String) Name of the project to list flags in, matched case-insensitively within `organization_id`. Use this when the project ID is not known until apply, for example a project created in the same configuration. When no project has this name, `flags` is empty rather than an error. More than one project with the name is an error. If a project with this name already exists, import it into your `posthog_project` resource rather than creating a second one: before the new project exists, this name matches the old one, and adopting its flags into resources pointed at the new project would plan to replace them, deleting them from the old project.
 
 ### Read-Only
 
