@@ -504,6 +504,9 @@ func TestParseRetryAfter(t *testing.T) {
 		{"five seconds", "5", 5 * time.Second, true},
 		{"sixty seconds", "60", 60 * time.Second, true},
 		{"invalid", "invalid", 0, false},
+		{"longer than a day is clamped", "90000", 24 * time.Hour, true},
+		{"too large for a Duration is clamped, not wrapped", "9223372037", 24 * time.Hour, true},
+		{"too large for an int64", "99999999999999999999", 0, false},
 	}
 
 	for _, tt := range tests {
@@ -1034,6 +1037,7 @@ func TestRetryTransport_RateLimitWait(t *testing.T) {
 		"Retry-After is honoured past MaxBackoff":           {rateLimited("1"), time.Second, true},
 		"Retry-After up to RateLimitMaxWait is honoured":    {rateLimited("2"), 2 * time.Second, true},
 		"Retry-After past RateLimitMaxWait is not waited":   {rateLimited("3"), 0, false},
+		"an overflowing Retry-After is not waited":          {rateLimited("9223372037"), 0, false},
 	}
 
 	for name, tt := range tests {

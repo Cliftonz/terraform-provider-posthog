@@ -245,7 +245,10 @@ func (t *RetryTransport) rateLimitWait(rateLimited int, resp *http.Response) (ti
 	if !ok {
 		return t.calculateBackoff(rateLimited), true
 	}
-	if retryAfter > t.Config.RateLimitMaxWait {
+	// Every wait must be positive, or the total budget never fills and the
+	// loop never ends. The parser already guarantees it; this keeps the
+	// guarantee next to the budget that depends on it.
+	if retryAfter <= 0 || retryAfter > t.Config.RateLimitMaxWait {
 		return 0, false
 	}
 	return retryAfter, true
@@ -484,14 +487,23 @@ func sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// maxRetryAfter clamps a parsed Retry-After. It is far past any wait the
+// transport accepts, so a clamped value is still refused, and it keeps the
+// conversion to a Duration from overflowing: a huge header would otherwise wrap
+// to a negative wait that passes every cap and is never added to a budget.
+const maxRetryAfter = 24 * time.Hour
+
 func parseRetryAfterHeader(header string) (time.Duration, bool) {
 	if header == "" {
 		return 0, false
 	}
 
-	if seconds, err := strconv.Atoi(header); err == nil && seconds > 0 {
-		return time.Duration(seconds) * time.Second, true
+	seconds, err := strconv.ParseInt(header, 10, 64)
+	if err != nil || seconds <= 0 {
+		return 0, false
 	}
-
-	return 0, false
+	if seconds > int64(maxRetryAfter/time.Second) {
+		return maxRetryAfter, true
+	}
+	return time.Duration(seconds) * time.Second, true
 }
