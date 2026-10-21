@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework-jsontypes/jsontypes"
@@ -45,12 +46,20 @@ const (
 	defaultWindowMinutes     = 5
 )
 
+// The grouping PostHog stores when a create leaves it out: one group for the whole alert.
+var defaultPlatformAlertGrouping = httpclient.PlatformAlertGrouping{
+	Mode:         groupingModeSingle,
+	Keys:         []string{},
+	MaxInstances: defaultMaxInstances,
+	OnOverflow:   onOverflowDegradeVisible,
+}
+
 // PostHog requires the logs condition on this API. These are the logs alerts API's defaults, so an
 // alert moved from posthog_logs_alert that never set them plans no change.
-var platformLogsConditionDefaults = map[string]attr.Value{
-	"threshold_count":    types.Int64Value(defaultThresholdCount),
-	"threshold_operator": types.StringValue(defaultThresholdOperator),
-	"window_minutes":     types.Int64Value(defaultWindowMinutes),
+var defaultPlatformLogsCondition = httpclient.PlatformAlertLogsCondition{
+	ThresholdCount:    defaultThresholdCount,
+	ThresholdOperator: defaultThresholdOperator,
+	WindowMinutes:     defaultWindowMinutes,
 }
 
 // The result labels a logs alert can group by.
@@ -249,12 +258,7 @@ func (o PlatformAlertOps) Schema() schema.Schema {
 			"grouping": schema.SingleNestedAttribute{
 				Optional: true,
 				Computed: true,
-				Default: objectdefault.StaticValue(types.ObjectValueMust(platformAlertGroupingAttrTypes, map[string]attr.Value{
-					"mode":          types.StringValue(groupingModeSingle),
-					"keys":          types.ListValueMust(types.StringType, []attr.Value{}),
-					"max_instances": types.Int64Value(defaultMaxInstances),
-					"on_overflow":   types.StringValue(onOverflowDegradeVisible),
-				})),
+				Default:  objectdefault.StaticValue(groupingObject(defaultPlatformAlertGrouping)),
 				MarkdownDescription: "How the alert splits its results into groups that fire and resolve on their " +
 					"own. Defaults to one group for the whole alert.\n\n" +
 					"~> **Changing `keys` drops every existing group silently.** PostHog deletes the groups and " +
@@ -275,7 +279,7 @@ func (o PlatformAlertOps) Schema() schema.Schema {
 						Optional:    true,
 						Computed:    true,
 						ElementType: types.StringType,
-						Default:     listdefault.StaticValue(types.ListValueMust(types.StringType, []attr.Value{})),
+						Default:     listdefault.StaticValue(stringList(defaultPlatformAlertGrouping.Keys)),
 						MarkdownDescription: "Result labels whose values make a group. Empty for `single`, required " +
 							"for `by_result_labels`. A `logs` alert can group by `service_name` and `severity_text`, " +
 							"and only with `threshold_operator = \"above\"`.",
@@ -352,14 +356,14 @@ func (o PlatformAlertOps) Schema() schema.Schema {
 					"condition": schema.SingleNestedAttribute{
 						Optional: true,
 						Computed: true,
-						Default:  objectdefault.StaticValue(types.ObjectValueMust(platformLogsConditionAttrTypes, platformLogsConditionDefaults)),
+						Default:  objectdefault.StaticValue(logsConditionObject(defaultPlatformLogsCondition)),
 						MarkdownDescription: "The bound the count is checked against. Defaults to above 100 in 5 " +
 							"minutes, the defaults of `posthog_logs_alert`.",
 						Attributes: map[string]schema.Attribute{
 							"threshold_count": schema.Int64Attribute{
 								Optional: true,
 								Computed: true,
-								Default:  int64default.StaticInt64(defaultThresholdCount),
+								Default:  int64default.StaticInt64(defaultPlatformLogsCondition.ThresholdCount),
 								MarkdownDescription: "Log entry count to compare against. Defaults to 100. Use `0` " +
 									"with `above` to fire on any matching log.",
 								Validators: []validator.Int64{
@@ -369,7 +373,7 @@ func (o PlatformAlertOps) Schema() schema.Schema {
 							"threshold_operator": schema.StringAttribute{
 								Optional:            true,
 								Computed:            true,
-								Default:             stringdefault.StaticString(defaultThresholdOperator),
+								Default:             stringdefault.StaticString(defaultPlatformLogsCondition.ThresholdOperator),
 								MarkdownDescription: "Whether the alert fires when the count is `above` or `below` the threshold. Defaults to `above`.",
 								Validators: []validator.String{
 									stringvalidator.OneOf(thresholdOperatorAbove, thresholdOperatorBelow),
@@ -378,7 +382,7 @@ func (o PlatformAlertOps) Schema() schema.Schema {
 							"window_minutes": schema.Int64Attribute{
 								Optional:            true,
 								Computed:            true,
-								Default:             int64default.StaticInt64(defaultWindowMinutes),
+								Default:             int64default.StaticInt64(defaultPlatformLogsCondition.WindowMinutes),
 								MarkdownDescription: "Time window in minutes over which log entries are counted: `5`, `10`, `15`, `30`, or `60`. Defaults to 5.",
 								Validators: []validator.Int64{
 									int64validator.OneOf(5, 10, 15, 30, 60),
@@ -410,42 +414,24 @@ func (o PlatformAlertOps) BuildCreateRequest(ctx context.Context, model Platform
 		EvaluationPeriods: model.EvaluationPeriods.ValueInt64(),
 		DatapointsToAlarm: model.DatapointsToAlarm.ValueInt64(),
 		CooldownMinutes:   model.CooldownMinutes.ValueInt64(),
-		Grouping: httpclient.PlatformAlertGrouping{
-			Mode:         groupingModeSingle,
-			Keys:         []string{},
-			MaxInstances: defaultMaxInstances,
-			OnOverflow:   onOverflowDegradeVisible,
-		},
+		Grouping:          defaultPlatformAlertGrouping,
 	}
 
+	// Defaults fill both blocks in every plan, so the nil checks only guard a hand-built model.
 	if model.Grouping != nil {
 		req.Grouping.Mode = model.Grouping.Mode.ValueString()
 		req.Grouping.MaxInstances = model.Grouping.MaxInstances.ValueInt64()
 		req.Grouping.OnOverflow = model.Grouping.OnOverflow.ValueString()
-		if !model.Grouping.Keys.IsNull() && !model.Grouping.Keys.IsUnknown() {
-			keys, d := util.StringListToSlice(ctx, model.Grouping.Keys)
-			diags.Append(d...)
-			if diags.HasError() {
-				return req, diags
-			}
-			if keys != nil {
-				req.Grouping.Keys = keys
-			}
+		keys, d := util.StringListToSlice(ctx, model.Grouping.Keys)
+		diags.Append(d...)
+		if keys != nil {
+			req.Grouping.Keys = keys
 		}
 	}
 
-	if !model.BlockedWindows.IsNull() && !model.BlockedWindows.IsUnknown() {
-		var windows []BlockedWindowTFModel
-		diags.Append(model.BlockedWindows.ElementsAs(ctx, &windows, false)...)
-		if diags.HasError() {
-			return req, diags
-		}
-		blockedWindows := make([]httpclient.LogsAlertBlockedWindow, len(windows))
-		for i, w := range windows {
-			blockedWindows[i] = httpclient.LogsAlertBlockedWindow{Start: w.Start.ValueString(), End: w.End.ValueString()}
-		}
-		req.ScheduleRestriction = &httpclient.LogsAlertSchedule{BlockedWindows: blockedWindows}
-	}
+	schedule, d := blockedWindowsFromSet(ctx, model.BlockedWindows)
+	diags.Append(d...)
+	req.ScheduleRestriction = schedule
 
 	if model.SourceKind.ValueString() == sourceKindLogs {
 		sourceConfig, d := buildLogsSourceConfig(ctx, model.Logs)
@@ -458,13 +444,7 @@ func (o PlatformAlertOps) BuildCreateRequest(ctx context.Context, model Platform
 
 func buildLogsSourceConfig(ctx context.Context, logs *PlatformAlertLogsTFModel) (httpclient.PlatformAlertLogsSourceConfig, diag.Diagnostics) {
 	var diags diag.Diagnostics
-	config := httpclient.PlatformAlertLogsSourceConfig{
-		Condition: httpclient.PlatformAlertLogsCondition{
-			ThresholdCount:    defaultThresholdCount,
-			ThresholdOperator: defaultThresholdOperator,
-			WindowMinutes:     defaultWindowMinutes,
-		},
-	}
+	config := httpclient.PlatformAlertLogsSourceConfig{Condition: defaultPlatformLogsCondition}
 	if logs == nil {
 		return config, diags
 	}
@@ -518,12 +498,7 @@ func (o PlatformAlertOps) MapResponseToModel(ctx context.Context, resp httpclien
 	}
 	model.BlockedWindows = blockedWindows
 
-	grouping, d := groupingToModel(resp.Grouping)
-	diags.Append(d...)
-	if diags.HasError() {
-		return diags
-	}
-	model.Grouping = grouping
+	model.Grouping = groupingToModel(resp.Grouping)
 
 	if model.SourceKind.ValueString() == sourceKindLogs {
 		logs, d := logsSourceConfigToModel(ctx, resp.SourceConfig, model.Logs)
@@ -537,26 +512,43 @@ func (o PlatformAlertOps) MapResponseToModel(ctx context.Context, resp httpclien
 	return diags
 }
 
-func groupingToModel(grouping *httpclient.PlatformAlertGrouping) (*PlatformAlertGroupingTFModel, diag.Diagnostics) {
-	stored := httpclient.PlatformAlertGrouping{
-		Mode:         groupingModeSingle,
-		MaxInstances: defaultMaxInstances,
-		OnOverflow:   onOverflowDegradeVisible,
-	}
+func groupingToModel(grouping *httpclient.PlatformAlertGrouping) *PlatformAlertGroupingTFModel {
+	stored := defaultPlatformAlertGrouping
 	if grouping != nil {
 		stored = *grouping
 	}
-	keys := make([]attr.Value, len(stored.Keys))
-	for i, key := range stored.Keys {
-		keys[i] = types.StringValue(key)
-	}
-	keyList, diags := types.ListValue(types.StringType, keys)
 	return &PlatformAlertGroupingTFModel{
 		Mode:         types.StringValue(stored.Mode),
-		Keys:         keyList,
+		Keys:         stringList(stored.Keys),
 		MaxInstances: types.Int64Value(stored.MaxInstances),
 		OnOverflow:   types.StringValue(stored.OnOverflow),
-	}, diags
+	}
+}
+
+// stringList builds a list of strings, empty rather than null for no strings.
+func stringList(values []string) types.List {
+	elements := make([]attr.Value, len(values))
+	for i, value := range values {
+		elements[i] = types.StringValue(value)
+	}
+	return types.ListValueMust(types.StringType, elements)
+}
+
+func groupingObject(grouping httpclient.PlatformAlertGrouping) types.Object {
+	return types.ObjectValueMust(platformAlertGroupingAttrTypes, map[string]attr.Value{
+		"mode":          types.StringValue(grouping.Mode),
+		"keys":          stringList(grouping.Keys),
+		"max_instances": types.Int64Value(grouping.MaxInstances),
+		"on_overflow":   types.StringValue(grouping.OnOverflow),
+	})
+}
+
+func logsConditionObject(condition httpclient.PlatformAlertLogsCondition) types.Object {
+	return types.ObjectValueMust(platformLogsConditionAttrTypes, map[string]attr.Value{
+		"threshold_count":    types.Int64Value(condition.ThresholdCount),
+		"threshold_operator": types.StringValue(condition.ThresholdOperator),
+		"window_minutes":     types.Int64Value(condition.WindowMinutes),
+	})
 }
 
 // logsSourceConfigToModel reads source_config for a logs alert. current is the model the
@@ -723,8 +715,9 @@ func validateGrouping(grouping *PlatformAlertGroupingTFModel, isLogs bool, opera
 		return diags
 	}
 	keysPath := path.Root("grouping").AtName("keys")
+	elements := grouping.Keys.Elements()
 	var keys []string
-	for _, element := range grouping.Keys.Elements() {
+	for _, element := range elements {
 		if value, ok := element.(types.String); ok && !value.IsUnknown() && !value.IsNull() {
 			keys = append(keys, value.ValueString())
 		}
@@ -732,14 +725,14 @@ func validateGrouping(grouping *PlatformAlertGroupingTFModel, isLogs bool, opera
 
 	switch grouping.Mode.ValueString() {
 	case groupingModeSingle:
-		if len(grouping.Keys.Elements()) > 0 {
+		if len(elements) > 0 {
 			diags.AddAttributeError(keysPath, "Grouping keys need by_result_labels",
 				"grouping.mode = \"single\" keeps one group for the whole alert and takes no keys. Set mode = "+
 					"\"by_result_labels\" to group by them, or remove keys.")
 		}
 		return diags
 	case groupingModeByLabels:
-		if len(grouping.Keys.Elements()) == 0 {
+		if len(elements) == 0 {
 			diags.AddAttributeError(keysPath, "Grouping needs keys",
 				"grouping.mode = \"by_result_labels\" needs at least one key to group by.")
 			return diags
@@ -750,7 +743,7 @@ func validateGrouping(grouping *PlatformAlertGroupingTFModel, isLogs bool, opera
 		return diags
 	}
 	for _, key := range keys {
-		if !containsString(logsGroupingKeys, key) {
+		if !slices.Contains(logsGroupingKeys, key) {
 			diags.AddAttributeError(keysPath, "Unsupported grouping key",
 				fmt.Sprintf("A logs alert can group by %s, not %q.", strings.Join(logsGroupingKeys, " and "), key))
 		}
@@ -761,15 +754,6 @@ func validateGrouping(grouping *PlatformAlertGroupingTFModel, isLogs bool, opera
 				"result, so a service that goes silent is never seen.")
 	}
 	return diags
-}
-
-func containsString(values []string, value string) bool {
-	for _, v := range values {
-		if v == value {
-			return true
-		}
-	}
-	return false
 }
 
 // logsAlertSourceProviders are the provider addresses a moved posthog_logs_alert may come from. A
@@ -817,12 +801,7 @@ func platformAlertFromLogsAlert(source LogsAlertTFModel) PlatformAlertTFModel {
 		CooldownMinutes:       source.CooldownMinutes,
 		BlockedWindows:        source.BlockedWindows,
 		LegacyConfigurationID: source.ID,
-		Grouping: &PlatformAlertGroupingTFModel{
-			Mode:         types.StringValue(groupingModeSingle),
-			Keys:         types.ListValueMust(types.StringType, []attr.Value{}),
-			MaxInstances: types.Int64Value(defaultMaxInstances),
-			OnOverflow:   types.StringValue(onOverflowDegradeVisible),
-		},
+		Grouping:              groupingToModel(nil),
 		Logs: &PlatformAlertLogsTFModel{
 			Condition: &PlatformAlertLogsConditionTFModel{
 				ThresholdCount:    source.ThresholdCount,
@@ -843,30 +822,30 @@ func platformAlertFromLogsAlert(source LogsAlertTFModel) PlatformAlertTFModel {
 	return target
 }
 
-// resolvePlatformAlert returns the platform alert for a model, looking it up when a move left the source
-// alert's id in state. A miss is an error rather than a 404: a 404 would drop the alert from state
-// and plan a second alert beside the logs alert that still exists.
-func resolvePlatformAlert(ctx context.Context, client httpclient.PosthogClient, model PlatformAlertTFModel) (httpclient.PlatformAlert, bool, error) {
+// resolvePlatformAlertID returns the platform alert id for a model. When a move left the source
+// alert's id in state, it looks the alert up and returns it too. A miss is an error rather than a
+// 404: a 404 would drop the alert from state and plan a second alert beside the logs alert.
+func resolvePlatformAlertID(ctx context.Context, client httpclient.PosthogClient, model PlatformAlertTFModel) (string, *httpclient.PlatformAlert, error) {
 	legacyID, moved := strings.CutPrefix(model.GetID(), legacyIDPrefix)
 	if !moved {
-		return httpclient.PlatformAlert{ID: model.GetID()}, false, nil
+		return model.GetID(), nil, nil
 	}
 	projectID := model.GetEffectiveProjectID()
 	alert, found, err := client.FindPlatformAlertByLegacyID(ctx, projectID, legacyID)
 	if err != nil {
-		return alert, true, fmt.Errorf("looking up the platform alert for logs alert %s: %w", legacyID, err)
+		return "", nil, fmt.Errorf("looking up the platform alert for logs alert %s: %w", legacyID, err)
 	}
 	if !found {
-		return alert, true, fmt.Errorf("logs alert %s has no platform alert in project %s, so it cannot move to "+
+		return "", nil, fmt.Errorf("logs alert %s has no platform alert in project %s, so it cannot move to "+
 			"posthog_platform_alert yet. Its project has not begun moving logs alerts to the alerts platform. "+
 			"Remove the moved block and keep managing it with posthog_logs_alert", legacyID, projectID)
 	}
 	if owner := util.PtrToString(alert.Owner); owner != "platform" {
-		return alert, true, fmt.Errorf("logs alert %s is still evaluated by the logs product (owner %q), so "+
+		return "", nil, fmt.Errorf("logs alert %s is still evaluated by the logs product (owner %q), so "+
 			"PostHog refuses changes to it through posthog_platform_alert. Remove the moved block and keep "+
 			"managing it with posthog_logs_alert until its project moves to the alerts platform", legacyID, owner)
 	}
-	return alert, true, nil
+	return alert.ID, &alert, nil
 }
 
 func (o PlatformAlertOps) Create(ctx context.Context, client httpclient.PosthogClient, model PlatformAlertTFModel, req httpclient.PlatformAlertRequest) (httpclient.PlatformAlert, error) {
@@ -874,25 +853,28 @@ func (o PlatformAlertOps) Create(ctx context.Context, client httpclient.PosthogC
 }
 
 func (o PlatformAlertOps) Read(ctx context.Context, client httpclient.PosthogClient, model PlatformAlertTFModel) (httpclient.PlatformAlert, httpclient.HTTPStatusCode, error) {
-	alert, moved, err := resolvePlatformAlert(ctx, client, model)
-	if err != nil || moved {
-		return alert, 0, err
+	id, resolved, err := resolvePlatformAlertID(ctx, client, model)
+	if err != nil {
+		return httpclient.PlatformAlert{}, 0, err
 	}
-	return client.GetPlatformAlert(ctx, model.GetEffectiveProjectID(), model.GetID())
+	if resolved != nil {
+		return *resolved, 0, nil
+	}
+	return client.GetPlatformAlert(ctx, model.GetEffectiveProjectID(), id)
 }
 
 func (o PlatformAlertOps) Update(ctx context.Context, client httpclient.PosthogClient, model PlatformAlertTFModel, req httpclient.PlatformAlertRequest) (httpclient.PlatformAlert, httpclient.HTTPStatusCode, error) {
-	alert, _, err := resolvePlatformAlert(ctx, client, model)
+	id, _, err := resolvePlatformAlertID(ctx, client, model)
 	if err != nil {
-		return alert, 0, err
+		return httpclient.PlatformAlert{}, 0, err
 	}
-	return client.UpdatePlatformAlert(ctx, model.GetEffectiveProjectID(), alert.ID, req)
+	return client.UpdatePlatformAlert(ctx, model.GetEffectiveProjectID(), id, req)
 }
 
 func (o PlatformAlertOps) Delete(ctx context.Context, client httpclient.PosthogClient, model PlatformAlertTFModel) (httpclient.HTTPStatusCode, error) {
-	alert, _, err := resolvePlatformAlert(ctx, client, model)
+	id, _, err := resolvePlatformAlertID(ctx, client, model)
 	if err != nil {
 		return 0, err
 	}
-	return client.DeletePlatformAlert(ctx, model.GetEffectiveProjectID(), alert.ID)
+	return client.DeletePlatformAlert(ctx, model.GetEffectiveProjectID(), id)
 }
