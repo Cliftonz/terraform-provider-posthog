@@ -208,13 +208,17 @@ func TestPlatformAlertRead_ResolvesAMovedAlert(t *testing.T) {
 		wantErr string
 	}{
 		"platform-owned alert resolves to its platform id": {
-			results: []httpclient.PlatformAlert{{ID: testPlatformAlertID, Owner: util.StringPtr("platform")}},
+			results: []httpclient.PlatformAlert{{ID: testPlatformAlertID, LegacyConfigurationID: util.StringPtr(testLogsAlertID), Owner: util.StringPtr("platform")}},
+		},
+		"a server that ignores the filter never adopts an unrelated alert": {
+			results: []httpclient.PlatformAlert{{ID: testPlatformAlertID, LegacyConfigurationID: util.StringPtr("0190c000-0000-0000-0000-0000000000ff"), Owner: util.StringPtr("platform")}},
+			wantErr: "has no platform alert",
 		},
 		"no platform copy fails the plan": {
 			wantErr: "has no platform alert",
 		},
 		"source-owned alert fails the plan": {
-			results: []httpclient.PlatformAlert{{ID: testPlatformAlertID, Owner: util.StringPtr("source")}},
+			results: []httpclient.PlatformAlert{{ID: testPlatformAlertID, LegacyConfigurationID: util.StringPtr(testLogsAlertID), Owner: util.StringPtr("source")}},
 			wantErr: "still evaluated by the logs product",
 		},
 	}

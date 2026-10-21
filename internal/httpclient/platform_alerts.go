@@ -101,8 +101,11 @@ func (c *PosthogClient) FindPlatformAlertByLegacyID(ctx context.Context, project
 	if err != nil {
 		return PlatformAlert{}, false, err
 	}
-	if len(list.Results) == 0 {
-		return PlatformAlert{}, false, nil
+	// A server older than the filter ignores it and lists every alert, so match the field too.
+	for _, alert := range list.Results {
+		if alert.LegacyConfigurationID != nil && *alert.LegacyConfigurationID == legacyID {
+			return alert, true, nil
+		}
 	}
-	return list.Results[0], true, nil
+	return PlatformAlert{}, false, nil
 }
