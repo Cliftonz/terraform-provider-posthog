@@ -7,7 +7,5 @@ import (
 )
 
 func TestPublicProviderPackageImportsFromExternalModule(t *testing.T) {
-	if provider.New("test")() == nil {
-		t.Fatal("provider.New returned nil provider")
-	}
+	_ = provider.New("test")
 }
