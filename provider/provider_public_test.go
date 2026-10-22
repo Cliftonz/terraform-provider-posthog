@@ -9,7 +9,7 @@ import (
 	"github.com/posthog/terraform-provider/provider"
 )
 
-func TestNewIsImportableFromOutsideModule(t *testing.T) {
+func TestNewReportsPostHogTypeName(t *testing.T) {
 	var resp fwprovider.MetadataResponse
 	provider.New("test")().Metadata(context.Background(), fwprovider.MetadataRequest{}, &resp)
 
