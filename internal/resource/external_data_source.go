@@ -3,6 +3,7 @@ package resource
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -96,9 +97,19 @@ func (o ExternalDataSourceOps) Schema() schema.Schema {
 				Required:    true,
 				ElementType: types.StringType,
 				MarkdownDescription: "List of table names to sync from the source (e.g. `[\"users\", \"orders\"]`). PostHog discovers available tables from the source; these must match discovered table names. " +
-					"The source-level update endpoint cannot edit the schema list, so changes force destroy+recreate.",
+					"Order does not matter. The source-level update endpoint cannot edit the schema list, so adding or removing a schema forces destroy+recreate.",
 				PlanModifiers: []planmodifier.List{
-					listplanmodifier.RequiresReplace(),
+					listplanmodifier.RequiresReplaceIf(
+						func(ctx context.Context, req planmodifier.ListRequest, resp *listplanmodifier.RequiresReplaceIfFuncResponse) {
+							planned, d := util.StringListToSlice(ctx, req.PlanValue)
+							resp.Diagnostics.Append(d...)
+							prior, d := util.StringListToSlice(ctx, req.StateValue)
+							resp.Diagnostics.Append(d...)
+							resp.RequiresReplace = !sameSchemaNames(planned, prior)
+						},
+						"Adding or removing a schema will force destroy and recreate; reordering will not.",
+						"Adding or removing a schema will force destroy and recreate; reordering will not.",
+					),
 				},
 			},
 			"sync_frequency": schema.StringAttribute{
@@ -216,10 +227,14 @@ func (o ExternalDataSourceOps) MapResponseToModel(ctx context.Context, resp http
 		for _, s := range resp.Schemas {
 			names = append(names, s.Name)
 		}
-		listVal, d := types.ListValueFrom(ctx, types.StringType, names)
+		configured, d := util.StringListToSlice(ctx, model.Schemas)
 		diags.Append(d...)
-		if !diags.HasError() {
-			model.Schemas = listVal
+		if !sameSchemaNames(configured, names) {
+			listVal, d := types.ListValueFrom(ctx, types.StringType, names)
+			diags.Append(d...)
+			if !diags.HasError() {
+				model.Schemas = listVal
+			}
 		}
 	} else if model.Schemas.IsNull() || model.Schemas.IsUnknown() {
 		model.Schemas = types.ListNull(types.StringType)
@@ -243,6 +258,10 @@ func (o ExternalDataSourceOps) MapResponseToModel(ctx context.Context, resp http
 	}
 
 	return diags
+}
+
+func sameSchemaNames(a, b []string) bool {
+	return slices.Equal(slices.Sorted(slices.Values(a)), slices.Sorted(slices.Values(b)))
 }
 
 func (o ExternalDataSourceOps) Create(ctx context.Context, client httpclient.PosthogClient, model ExternalDataSourceTFModel, req map[string]any) (httpclient.ExternalDataSource, error) {
