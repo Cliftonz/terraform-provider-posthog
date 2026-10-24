@@ -32,3 +32,22 @@ func TestProjectDeleteSucceedsWhenAlreadyBeingDeleted(t *testing.T) {
 
 	require.NoError(t, err)
 }
+
+func TestProjectDeleteFailsOnOtherBadRequest(t *testing.T) {
+	const orgID = "01890a5c-7a3b-0000-8f1e-5c2d9e1b4a77"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"type":"validation_error","code":"invalid","detail":"Cannot delete the only project.","attr":null}`))
+	}))
+	defer server.Close()
+
+	client := httpclient.NewClient(server.Client(), server.URL, "test-key", "test")
+	model := ProjectTFModel{}
+	model.ID = types.Int64Value(42)
+	model.OrganizationID = types.StringValue(orgID)
+
+	_, err := ProjectOps{}.Delete(context.Background(), client, model)
+
+	require.ErrorContains(t, err, "Cannot delete the only project.")
+}
