@@ -48,9 +48,12 @@ func (c *PosthogClient) UpdateFeatureFlag(ctx context.Context, projectID, id str
 }
 
 func (c *PosthogClient) DeleteFeatureFlag(ctx context.Context, projectID, id string) (HTTPStatusCode, error) {
-	existing, _, err := c.GetFeatureFlag(ctx, projectID, id)
+	existing, status, err := c.GetFeatureFlag(ctx, projectID, id)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get feature flag for deletion: %w", err)
+	}
+	if existing.Deleted != nil && *existing.Deleted {
+		return status, nil
 	}
 
 	deleted := true
