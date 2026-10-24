@@ -2,6 +2,8 @@ package resource
 
 import (
 	"context"
+	"net/http"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -115,5 +117,9 @@ func (o ProjectOps) Update(ctx context.Context, client httpclient.PosthogClient,
 }
 
 func (o ProjectOps) Delete(ctx context.Context, client httpclient.PosthogClient, model ProjectTFModel) (httpclient.HTTPStatusCode, error) {
-	return client.DeleteProject(ctx, model.GetEffectiveOrganizationID(), model.GetID())
+	status, err := client.DeleteProject(ctx, model.GetEffectiveOrganizationID(), model.GetID())
+	if status == http.StatusBadRequest && strings.Contains(err.Error(), "already being deleted") {
+		return status, nil
+	}
+	return status, err
 }
