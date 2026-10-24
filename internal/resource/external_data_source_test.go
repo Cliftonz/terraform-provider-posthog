@@ -9,7 +9,9 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/posthog/terraform-provider/internal/httpclient"
 	"github.com/posthog/terraform-provider/internal/resource/core"
 	"github.com/posthog/terraform-provider/internal/util"
@@ -203,6 +205,66 @@ func TestExternalDataSourceMapResponseToModel_SyncFrequencyFromFirstSchema(t *te
 	diags := ops.MapResponseToModel(context.Background(), resp, &model)
 	require.False(t, diags.HasError())
 	assert.Equal(t, "6hour", model.SyncFrequency.ValueString())
+}
+
+func TestExternalDataSourceMapResponseToModel_KeepsConfiguredSchemaOrder(t *testing.T) {
+	ops := ExternalDataSourceOps{}
+	model := ExternalDataSourceTFModel{Schemas: mustListOf(t, "users", "orders")}
+
+	resp := httpclient.ExternalDataSource{
+		ID:      testEDSSourceID,
+		Schemas: []httpclient.ExternalDataSourceSchema{{Name: "orders"}, {Name: "users"}},
+	}
+
+	diags := ops.MapResponseToModel(context.Background(), resp, &model)
+	require.False(t, diags.HasError())
+	assert.Equal(t, mustListOf(t, "users", "orders"), model.Schemas)
+}
+
+func TestExternalDataSourceMapResponseToModel_ReportsChangedSchemaSet(t *testing.T) {
+	ops := ExternalDataSourceOps{}
+	model := ExternalDataSourceTFModel{Schemas: mustListOf(t, "users", "orders")}
+
+	resp := httpclient.ExternalDataSource{
+		ID:      testEDSSourceID,
+		Schemas: []httpclient.ExternalDataSourceSchema{{Name: "orders"}, {Name: "payments"}},
+	}
+
+	diags := ops.MapResponseToModel(context.Background(), resp, &model)
+	require.False(t, diags.HasError())
+	assert.Equal(t, mustListOf(t, "orders", "payments"), model.Schemas)
+}
+
+func TestExternalDataSourceSchemasReplacement(t *testing.T) {
+	tests := map[string]struct {
+		config      types.List
+		wantReplace bool
+	}{
+		"reordered schemas do not replace": {config: mustListOf(t, "users", "orders"), wantReplace: false},
+		"added schema replaces":            {config: mustListOf(t, "orders", "users", "payments"), wantReplace: true},
+		"swapped schema replaces":          {config: mustListOf(t, "orders", "payments"), wantReplace: true},
+	}
+
+	attr := ExternalDataSourceOps{}.Schema().Attributes["schemas"].(schema.ListAttribute)
+	present := tftypes.NewValue(tftypes.String, "present")
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			req := planmodifier.ListRequest{
+				Plan:        tfsdk.Plan{Raw: present},
+				State:       tfsdk.State{Raw: present},
+				ConfigValue: tc.config,
+				PlanValue:   tc.config,
+				StateValue:  mustListOf(t, "orders", "users"),
+			}
+			resp := &planmodifier.ListResponse{PlanValue: tc.config}
+
+			attr.PlanModifiers[0].PlanModifyList(context.Background(), req, resp)
+
+			require.False(t, resp.Diagnostics.HasError())
+			assert.Equal(t, tc.wantReplace, resp.RequiresReplace)
+		})
+	}
 }
 
 func TestExternalDataSourceCRUD_VerifiesRequestShape(t *testing.T) {
