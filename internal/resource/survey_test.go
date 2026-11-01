@@ -391,3 +391,48 @@ func TestSurveyClearNullableIntegerFields(t *testing.T) {
 		assert.Nil(t, raw, "%s must serialize as JSON null to clear", key)
 	}
 }
+
+func TestSurveyUpdateKeepsTargetingFlagCreatedFromFilters(t *testing.T) {
+	var patchBody map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPatch {
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&patchBody))
+		}
+		_ = json.NewEncoder(w).Encode(httpclient.Survey{
+			ID:            testSurveyID,
+			TargetingFlag: map[string]interface{}{"id": float64(84)},
+		})
+	}))
+	defer server.Close()
+
+	client := httpclient.NewClient(server.Client(), server.URL, "test-key", "test")
+	ops := SurveyOps{}
+	config := SurveyTFModel{
+		BaseProjectID:            core.BaseProjectID{ProjectID: types.StringValue(testSurveyProjectID)},
+		Name:                     types.StringValue(testSurveyName),
+		Type:                     types.StringValue(testSurveyType),
+		QuestionsJSON:            types.StringValue(testSurveyQuestionJSON),
+		TargetingFlagFiltersJSON: types.StringValue(`{"groups":[{"properties":[],"rollout_percentage":50}]}`),
+	}
+
+	createReq, diags := ops.BuildCreateRequest(context.Background(), config)
+	require.False(t, diags.HasError())
+	created, err := ops.Create(context.Background(), client, config, createReq)
+	require.NoError(t, err)
+	state := config
+	require.False(t, ops.MapResponseToModel(context.Background(), created, &state).HasError())
+
+	plan := config
+	plan.ID = state.ID
+	updateReq, diags := ops.BuildUpdateRequest(context.Background(), plan, state)
+	require.False(t, diags.HasError())
+	_, _, err = ops.Update(context.Background(), client, state, updateReq)
+	require.NoError(t, err)
+
+	assert.NotContains(t, patchBody, "remove_targeting_flag")
+	assert.NotContains(t, patchBody, "targeting_flag_id")
+	assert.Equal(t, map[string]interface{}{
+		"groups": []interface{}{map[string]interface{}{"properties": []interface{}{}, "rollout_percentage": float64(50)}},
+	}, patchBody["targeting_flag_filters"])
+}

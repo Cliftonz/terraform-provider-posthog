@@ -410,7 +410,9 @@ func mapSurveyCoreFields(resp httpclient.Survey, model *SurveyTFModel) {
 
 func mapSurveyRelationshipFields(resp httpclient.Survey, model *SurveyTFModel) {
 	model.LinkedFlagID = int64ValueFromMapOrNull(resp.LinkedFlag)
-	model.TargetingFlagID = int64ValueFromMapOrNull(resp.TargetingFlag)
+	if !core.IsKnown(model.TargetingFlagFiltersJSON) {
+		model.TargetingFlagID = int64ValueFromMapOrNull(resp.TargetingFlag)
+	}
 
 	if model.LinkedInsightID.IsUnknown() {
 		model.LinkedInsightID = types.Int64Null()
